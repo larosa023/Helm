@@ -1,0 +1,132 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Zig
+        run: pip install ziglang
+
+      - name: Build Helm.exe
+        run: ./build.sh
+
+      - name: Package
+        run: |
+          cp README.md dist/
+          cd dist
+          zip Helm-win-x64.zip Helm.exe README.md
+          sha256sum Helm.exe Helm-win-x64.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Helm-win-x64
+          path: |
+            dist/Helm.exe
+            dist/Helm-win-x64.zip
+            dist/SHA256SUMS.txt
+
+  # Runs the real exe on Windows: it must load, open its window, draw every page and quit cleanly.
+  smoke:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Helm-win-x64
+          path: dist
+
+      - name: Start, look at every page, quit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path dist\Helm.exe).Path
+          $p = Start-Process $exe -ArgumentList '--version' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "--version exited with $($p.ExitCode)" }
+
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          New-Item -ItemType Directory -Force shots | Out-Null
+          function Shot($name) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("shots\$name.png")
+            $g.Dispose(); $bmp.Dispose()
+          }
+          foreach ($page in 'overview','cleanup','storage','startup','tweaks','tools','themes','settings') {
+            $app = Start-Process $exe -ArgumentList '--page', $page -PassThru
+            Start-Sleep -Seconds 6
+            if ($app.HasExited) { throw "Helm exited on its own on the $page page (code $($app.ExitCode))" }
+            Shot $page
+            Start-Process $exe -ArgumentList '--quit' -Wait
+            if (-not $app.WaitForExit(15000)) { throw "Helm didn't quit from the $page page" }
+          }
+          $log = Join-Path $env:LOCALAPPDATA 'Helm\helm.log'
+          if (Test-Path $log) { Get-Content $log -Tail 60 }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-screenshots
+          path: shots
+
+  # A release is published automatically when HELM_VERSION in src/common.h changes on main (or a
+  # v* tag is pushed). Versions with a "-" such as 0.2.0-beta.1 are pre-releases (the Beta channel).
+  release:
+    needs: [build, smoke]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Helm-win-x64
+          path: dist
+
+      - name: Decide release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(grep -oP 'HELM_VERSION L"\K[^"]+' src/common.h)
+          TAG="v$VER"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then TAG="${GITHUB_REF#refs/tags/}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-* ]]; then echo "pre=true" >> "$GITHUB_OUTPUT"; else echo "pre=false" >> "$GITHUB_OUTPUT"; fi
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"; echo "Release $TAG already exists"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"; echo "Will publish $TAG"
+          fi
+
+      - name: Release
+        if: steps.rel.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Helm ${{ steps.rel.outputs.tag }}
+          prerelease: ${{ steps.rel.outputs.pre }}
+          body_path: CHANGELOG-latest.md
+          files: |
+            dist/Helm-win-x64.zip
+            dist/Helm.exe
+            dist/SHA256SUMS.txt
